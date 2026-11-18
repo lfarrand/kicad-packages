@@ -1019,3 +1019,153 @@ def test_cli_get_with_dependencies(tmp_path):
                      str(tmp_path / "deps"), "--os-release", os_release(tmp_path), "--github-output", str(output)], pages)
     assert code == 0 and output.read_text() == "key=%s\ncache-hit=true\ndependencies=1\n" % KEY
     assert os.listdir(str(tmp_path / "deps")) == ["libfoo_1.0_amd64.deb"]
+
+
+# ---- staging dependencies for apt's cache ---------------------------------------------------------------------------
+
+class Apt:
+    """apt-get --print-uris and apt-cache show stand-in over {archive name: bytes the index vouches for}"""
+
+    def __init__(self, index, uris_fail=False, show_fail=False, show=None, extra_lines=()):
+        self.index, self.uris_fail, self.show_fail, self.show, self.extra = index, uris_fail, show_fail, show, extra_lines
+        self.calls = []
+
+    def __call__(self, argv):
+        self.calls.append(argv)
+        if argv[0] == "apt-get":
+            assert "--print-uris" in argv and "--no-install-recommends" in argv and "install" in argv
+            assert os.path.isdir(os.path.join([a for a in argv if a.startswith("Dir::Cache")][0].split("=")[1], "partial"))
+            if self.uris_fail:
+                return 100, "", "E: Unable to correct problems"
+            lines = ["'file:/x/kicad_10.0.8.ubuntu24.04.1_amd64.deb' kicad_10.0.8~ubuntu24.04.1_amd64.deb 48034236 "]
+            lines += ["'http://archive.ubuntu.com/ubuntu/pool/main/x/%s' %s %d MD5Sum:0123" % (n, n, len(c))
+                      for n, c in self.index.items()]
+            return 0, "\n".join(lines + list(self.extra)) + "\n", ""
+        assert argv[:2] == ["apt-cache", "show"]
+        if self.show_fail:
+            return 100, "", "E: No packages found"
+        if self.show is not None:
+            return 0, self.show, ""
+        stanzas = []
+        for name, content in self.index.items():
+            package, version, arch = name[:-4].split("_")
+            version = version.replace("%3a", ":")
+            if "%s=%s" % (package, version) not in argv:
+                continue                                                # only what was asked about
+            stanzas.append("Package: %s\nArchitecture: %s\nVersion: %s\nDepends: libc6 (>= 2.34)\nFilename: pool/%s\n"
+                           "Size: %d\nMD5sum: 0123\nSHA256: %s\nDescription: something\n very long\n"
+                           % (package, arch, version, name, len(content), sha(content)))
+        return 0, "\n".join(stanzas), ""
+
+
+INDEX = {"libfoo_1.0_amd64.deb": b"foo package", "libbar_1%3a2.0-1_all.deb": b"bar package",
+         "libnew_3.1_amd64.deb": b"updated since the bundle was made"}
+
+
+def bundle_dir(tmp_path, files):
+    folder = tmp_path / "bundle"
+    folder.mkdir()
+    for name, content in files.items():
+        (folder / name).write_bytes(content)
+    return str(folder)
+
+
+def stage(tmp_path, files, apt):
+    log = []
+    out = tmp_path / "checked"
+    count = kc.stage_dependencies(some_debs(tmp_path), bundle_dir(tmp_path, files), str(out), apt, log=log.append)
+    return count, log, out
+
+
+def test_apt_wants_lists_what_apt_would_download(tmp_path):
+    apt = Apt(INDEX, extra_lines=["'http://x/../evil.deb' ../evil.deb 3 MD5Sum:1", "W: some warning", ""])
+    assert kc.apt_wants(some_debs(tmp_path), str(tmp_path / "s"), apt) == list(INDEX)      # not the local kicad file
+    with pytest.raises(kc.CacheError, match="--print-uris failed .exit 100.: E: Unable to correct problems"):
+        kc.apt_wants(some_debs(tmp_path), str(tmp_path / "s"), Apt(INDEX, uris_fail=True))
+
+
+def test_apt_index_sha256(tmp_path):
+    apt = Apt(INDEX)
+    assert kc.apt_index_sha256(list(INDEX), apt) == {name: sha(content) for name, content in INDEX.items()}
+    assert apt.calls[0] == ["apt-cache", "show", "libbar=1:2.0-1", "libfoo=1.0", "libnew=3.1"]
+    assert kc.apt_index_sha256([], Apt(INDEX)) == {} and kc.apt_index_sha256(["odd_name.deb"], Apt(INDEX)) == {}
+    with pytest.raises(kc.CacheError, match="apt-cache show failed"):
+        kc.apt_index_sha256(list(INDEX), Apt(INDEX, show_fail=True))
+
+
+def test_apt_index_sha256_takes_only_the_exact_package_version_and_architecture():
+    a, b = "a" * 64, "b" * 64
+    show = ("Package: libfoo\nVersion: 1.0\nArchitecture: i386\nSHA256: %s\n\n"          # another architecture
+            "Package: libfoo\nVersion: 1.1\nArchitecture: amd64\nSHA256: %s\n\n"         # another version
+            "Package: libfoo\nVersion: 1.0\nArchitecture: amd64\nSHA256: nothex\n\n"     # no usable hash
+            "Package: libfoo\nVersion: 1.0\nArchitecture: amd64\nSHA256: %s\n\n"
+            "Package: libfoo\nVersion: 1.0\nArchitecture: amd64\nSHA256: %s\n" % (b, b, a, a))   # same record twice
+    assert kc.apt_index_sha256(["libfoo_1.0_amd64.deb"], Apt({}, show=show)) == {"libfoo_1.0_amd64.deb": a}
+    with pytest.raises(kc.CacheError, match="two SHA-256 values"):
+        kc.apt_index_sha256(["libfoo_1.0_amd64.deb"], Apt({}, show=show + "\nPackage: libfoo\nVersion: 1.0\n"
+                                                           "Architecture: amd64\nSHA256: %s\n" % b))
+
+
+def test_stage_takes_only_files_apt_wants_and_its_index_vouches_for(tmp_path):
+    files = {"libfoo_1.0_amd64.deb": b"foo package",                    # wanted, and the right bytes
+             "libbar_1%3a2.0-1_all.deb": b"bar packagE",                 # wanted, same size, wrong bytes
+             "libnew_3.0_amd64.deb": b"the version before the update",  # apt wants 3.1 now
+             "stray_1_all.deb": b"nobody asked"}                        # apt does not want it at all
+    count, log, out = stage(tmp_path, files, Apt(INDEX))
+    assert count == 1 and os.listdir(str(out)) == ["libfoo_1.0_amd64.deb"]
+    assert (out / "libfoo_1.0_amd64.deb").read_bytes() == b"foo package"
+    assert log == ["1 of the 3 packages apt would download are in the store's bundle and match apt's index"]
+
+
+def test_stage_of_a_whole_bundle(tmp_path):
+    count, log, out = stage(tmp_path, dict(INDEX), Apt(INDEX))
+    assert count == 3 and sorted(os.listdir(str(out))) == sorted(INDEX)
+
+
+def test_stage_without_a_bundle_does_nothing(tmp_path):
+    apt = Apt(INDEX)
+    count, log, out = stage(tmp_path, {}, apt)
+    assert count == 0 and log == [] and apt.calls == [] and not out.exists()
+    assert kc.stage_dependencies([], str(tmp_path / "no such folder"), str(out), apt, log=log.append) == 0
+
+
+@pytest.mark.parametrize("apt, message", [(Apt(INDEX, uris_fail=True), "--print-uris failed"),
+                                          (Apt(INDEX, show_fail=True), "apt-cache show failed")])
+def test_stage_never_fails_a_job_and_stages_nothing_it_could_not_check(tmp_path, apt, message):
+    count, log, out = stage(tmp_path, dict(INDEX), apt)
+    assert count == 0 and not out.exists()
+    assert log[0].startswith("::warning::KiCad's stored dependencies could not be checked") and message in log[0]
+
+
+def test_stage_stages_nothing_when_the_index_has_no_sha256(tmp_path):
+    show = "Package: libfoo\nVersion: 1.0\nArchitecture: amd64\nMD5sum: 0123\n"
+    count, log, out = stage(tmp_path, dict(INDEX), Apt(INDEX, show=show))
+    assert count == 0 and os.listdir(str(out)) == []
+
+
+def test_stage_replaces_what_an_earlier_attempt_staged(tmp_path):
+    out = tmp_path / "checked"
+    out.mkdir()
+    (out / "left_over_1_all.deb").write_bytes(b"x")
+    count = kc.stage_dependencies(some_debs(tmp_path), bundle_dir(tmp_path, dict(INDEX)), str(out), Apt(INDEX),
+                                  log=lambda m: None)
+    assert count == 3 and "left_over_1_all.deb" not in os.listdir(str(out)) and ".scratch" not in os.listdir(str(out))
+
+
+def test_cli_stage(tmp_path):
+    debs = tmp_path / "debs"
+    debs.mkdir()
+    (debs / "kicad_10.0.8.ubuntu24.04.1_amd64.deb").write_bytes(b"x")
+    (debs / "notes.txt").write_text("not a package")
+    apt = Apt(INDEX)
+    code, out = cli(["stage", "--debs", str(debs), "--dependencies", bundle_dir(tmp_path, dict(INDEX)),
+                     "--out", str(tmp_path / "checked")], run=apt)
+    assert code == 0 and out == ["3 of the 3 packages apt would download are in the store's bundle and match apt's index"]
+    assert [a for a in apt.calls[0] if a.endswith(".deb")] == [str(debs / "kicad_10.0.8.ubuntu24.04.1_amd64.deb")]
+    assert cli(["stage", "--debs", str(tmp_path / "none"), "--dependencies", "x", "--out", "y"], run=apt) == (0, [])
+
+
+def test_file_sha256(tmp_path):
+    path = tmp_path / "f"
+    path.write_bytes(b"abc" * 700000)
+    assert kc.file_sha256(str(path)) == sha(b"abc" * 700000)

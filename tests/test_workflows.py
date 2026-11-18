@@ -58,8 +58,11 @@ def test_the_action_passes_every_input_on_and_declares_its_outputs():
     for name in action["outputs"]:
         assert action["outputs"][name]["value"] == "${{ steps.get.outputs.%s }}" % name
     script = install["run"]
-    # the stored dependencies go into apt's cache before apt is asked for anything
-    assert script.index('cp "$KICAD_DEPS"/*.deb /var/cache/apt/archives/') < script.index("apt_get 180 update")
+    # only dependencies that `stage` checked against apt's index go into apt's cache, after the index is fetched
+    assert script.count("/var/cache/apt/archives/") == 1
+    assert '$SUDO cp "$KICAD_DEPS-checked"/*.deb /var/cache/apt/archives/' in script
+    assert 'stage --debs "$KICAD_DEBS"' in script and '--out "$KICAD_DEPS-checked" || true' in script
+    assert "apt_get 180 update && stage &&" in script
     assert script.count("--no-install-recommends") == 2 and script.count('"$KICAD_DEBS"/*.deb') == 2
     # the downloads have a time limit and are tried again; the install itself is never cut short
     download = script.index("apt_get 300 install -y --no-install-recommends --download-only")

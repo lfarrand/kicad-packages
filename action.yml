@@ -56,20 +56,25 @@ runs:
         python3 "$GITHUB_ACTION_PATH/tools/kicad_cache.py" "$@"
     - name: Install KiCad
       shell: bash
-      # KiCad's dependencies (about 100 Ubuntu packages) are not the PPA's: apt resolves them. The copies the
-      # store holds go into apt's download cache first; apt checks each against its own index and downloads only
-      # what is missing or has changed since. A runner's Ubuntu mirror is sometimes so slow that this alone
-      # outlasts a job, so that download is a step of its own with a time limit, tried again (apt keeps what it
-      # already has); the install after it needs no network, and is never interrupted.
+      # KiCad's dependencies (about 100 Ubuntu packages) are not the PPA's: apt resolves them. Of the copies the
+      # store holds, those that apt is about to download and whose SHA-256 is the one in apt's own signed index
+      # go into apt's download cache first (`stage`; apt itself would check only their size), so apt downloads
+      # only what is missing or has changed since. A runner's Ubuntu mirror is sometimes so slow that this
+      # alone outlasts a job, so that download is a step of its own with a time limit, tried again (apt keeps
+      # what it already has); the install after it needs no network, and is never interrupted.
       run: |
         if [ "$(id -u)" = 0 ]; then SUDO=""; else SUDO=sudo; fi
-        if compgen -G "$KICAD_DEPS/*.deb" > /dev/null; then
-          $SUDO cp "$KICAD_DEPS"/*.deb /var/cache/apt/archives/
-        fi
         apt_get() { $SUDO env DEBIAN_FRONTEND=noninteractive timeout --kill-after=30 "$1" apt-get \
           -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "${@:2}"; }
+        stage() {
+          python3 "$GITHUB_ACTION_PATH/tools/kicad_cache.py" stage --debs "$KICAD_DEBS" \
+            --dependencies "$KICAD_DEPS" --out "$KICAD_DEPS-checked" || true
+          if compgen -G "$KICAD_DEPS-checked/*.deb" > /dev/null; then
+            $SUDO cp "$KICAD_DEPS-checked"/*.deb /var/cache/apt/archives/
+          fi
+        }
         for attempt in 1 2 3 4; do
-          if apt_get 180 update &&
+          if apt_get 180 update && stage &&
              apt_get 300 install -y --no-install-recommends --download-only "$KICAD_DEBS"/*.deb; then
             $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$KICAD_DEBS"/*.deb
             exit 0

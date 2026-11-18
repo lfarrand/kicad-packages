@@ -13,13 +13,16 @@ public GitHub repository, named by a version key:
           against its SHA-256.
   store   (this repository's store workflow) finds the KiCad the PPA publishes now, and if there is
           no release with its key yet, downloads its packages once and publishes them as that release.
+  stage   picks the stored dependency packages that apt's own index vouches for (see below).
   check   fails unless the installed packages are the KiCad version asked for.
   key     prints the version key for this machine.
 
 The KiCad packages of a published release are never changed. Beside them the store keeps the Ubuntu
 packages KiCad depends on (about 100, from Ubuntu's own archive) as one bundle per release, refreshed
-weekly: `get` unpacks it for apt's download cache, so that an install does not wait for a slow Ubuntu
-mirror. apt checks every cached file against its own index, so a stale bundle only costs a download.
+weekly, so that an install does not wait for a slow Ubuntu mirror: `get` unpacks it, and `stage` picks out
+the files apt is about to download and whose SHA-256 is the one in apt's signed package index. Only those
+go into apt's download cache (apt itself checks no more than the size of a file it finds there), so a
+stale or damaged bundle only costs a download.
 
 Python 3.9 or later, standard library only; `store` also
 needs the GitHub CLI (`gh`) with a token that can write releases.
@@ -30,6 +33,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -363,6 +367,81 @@ def get_dependencies(repo, key, dest, net, log=print):
     return count
 
 
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def apt_wants(debs, scratch, run):
+    """[archive file name] of every package apt would download to install the .deb files (none of them cached)"""
+    os.makedirs(os.path.join(scratch, "partial"), exist_ok=True)
+    code, out, err = run(["apt-get", "-o", "Dir::Cache::archives=" + scratch, "install", "-y", "--no-install-recommends",
+                          "--print-uris", "-qq"] + [os.path.abspath(d) for d in debs])
+    if code != 0:
+        raise CacheError("apt-get --print-uris failed (exit %d): %s" % (code, (err or out).strip()[-300:]))
+    names = []
+    for line in out.splitlines():
+        m = re.match(r"^'([^']*)' (\S+) \d+", line)
+        if m and not m.group(1).startswith("file:") and DEPS_MEMBER_RE.match(m.group(2)):
+            names.append(m.group(2))
+    return names
+
+
+def apt_index_sha256(names, run):
+    """{archive file name: SHA-256 in apt's package index}, for the names apt's index has a SHA-256 for.
+    The index is the one `apt-get update` fetched and checked the signature of."""
+    wanted = {}
+    for name in names:
+        parts = name[:-len(".deb")].split("_")
+        if len(parts) == 3:
+            wanted[(parts[0], urllib.parse.unquote(parts[1]), parts[2])] = name
+    if not wanted:
+        return {}
+    code, out, err = run(["apt-cache", "show"] + sorted({"%s=%s" % (p, v) for p, v, _ in wanted}))
+    if code != 0:
+        raise CacheError("apt-cache show failed (exit %d): %s" % (code, (err or out).strip()[-300:]))
+    found = {}
+    for stanza in re.split(r"\n\s*\n", out):
+        fields = dict(m.groups() for m in re.finditer(r"^(Package|Version|Architecture|SHA256): *(\S+) *$", stanza, re.M))
+        name = wanted.get((fields.get("Package"), fields.get("Version"), fields.get("Architecture")))
+        if name and SHA256_RE.match(fields.get("SHA256", "")):
+            if found.setdefault(name, fields["SHA256"]) != fields["SHA256"]:
+                raise CacheError("apt's index gives two SHA-256 values for %s" % name)
+    return found
+
+
+def stage_dependencies(debs, bundle, out_dir, run, log=print):
+    """Copy into out_dir the files of an unpacked dependency bundle that apt is about to download for these
+    .deb files and whose SHA-256 is the one in apt's index: those, and only those, may go into apt's cache.
+    The number copied; 0 with a warning when anything goes wrong, so this never fails a job."""
+    if os.path.isdir(out_dir):
+        shutil.rmtree(out_dir)
+    try:
+        have = set(os.listdir(bundle)) if os.path.isdir(bundle) else set()
+        if not have:
+            return 0
+        os.makedirs(out_dir)
+        wanted = apt_wants(debs, os.path.join(out_dir, ".scratch"), run)
+        names = [n for n in wanted if n in have]
+        hashes = apt_index_sha256(names, run)
+        count = 0
+        for name in names:
+            source = os.path.join(bundle, name)
+            if name in hashes and os.path.isfile(source) and file_sha256(source) == hashes[name]:
+                shutil.copyfile(source, os.path.join(out_dir, name))
+                count += 1
+        shutil.rmtree(os.path.join(out_dir, ".scratch"), ignore_errors=True)
+    except (CacheError, OSError) as e:
+        log("::warning::KiCad's stored dependencies could not be checked (%s): apt downloads them instead" % e)
+        shutil.rmtree(out_dir, ignore_errors=True)
+        return 0
+    log("%d of the %d packages apt would download are in the store's bundle and match apt's index" % (count, len(wanted)))
+    return count
+
+
 def get(version, packages, ubuntu, codename, arch, repo, dest, net, fallback=True, log=print):
     """Put the .deb files of `packages` at KiCad `version` into dest: from the store, and whatever the store
     does not hold from Launchpad (unless fallback is off). {key, cache-hit: true|partial|false, files}."""
@@ -499,11 +578,7 @@ def build_deps_bundle(debs, folder, run, now, root=None):
             info.mode = 0o644
             with open(os.path.join(archives, name), "rb") as f:
                 tar.addfile(info, f)
-    digest = hashlib.sha256()
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(1 << 20), b""):
-            digest.update(block)
-    return path, {"schema": 1, "asset": asset, "sha256": digest.hexdigest(), "size": os.path.getsize(path),
+    return path, {"schema": 1, "asset": asset, "sha256": file_sha256(path), "size": os.path.getsize(path),
                   "count": len(names), "created": now.replace(microsecond=0).isoformat()}
 
 
@@ -700,6 +775,10 @@ def main(argv=None, net=None, run=run_command, out=print):
     s.add_argument("--work", required=True, help="folder for the downloads")
     s.add_argument("--version", help="store this KiCad version instead of the newest (if Launchpad still has it)")
     s.add_argument("--no-dependencies", action="store_true", help="leave the dependency bundles alone")
+    t = sub.add_parser("stage", help="pick the stored dependency packages that apt's index vouches for")
+    t.add_argument("--debs", required=True, help="folder with the KiCad .deb files (get --dest)")
+    t.add_argument("--dependencies", required=True, help="folder with the unpacked bundle (get --dependencies-dest)")
+    t.add_argument("--out", required=True, help="folder for the checked files, to copy into apt's cache")
     c = sub.add_parser("check", help="fail unless the installed packages are this KiCad version")
     c.add_argument("--version", required=True)
     c.add_argument("--packages", default="kicad")
@@ -738,6 +817,11 @@ def main(argv=None, net=None, run=run_command, out=print):
                 raise CacheError("cannot read %s: %s" % (args.config, e))
             store(config, args.repo, args.work, net, run=run, version=args.version or None, log=out,
                   dependencies=not args.no_dependencies)
+        elif args.command == "stage":
+            debs = sorted(os.path.join(args.debs, f) for f in os.listdir(args.debs) if f.endswith(".deb")) \
+                if os.path.isdir(args.debs) else []
+            if debs:
+                stage_dependencies(debs, args.dependencies, args.out, run, log=out)
         elif args.command == "check":
             check_installed(args.version, names(args.packages), run)
             out("KiCad %s is installed (%s)" % (args.version, " ".join(names(args.packages))))

@@ -50,11 +50,13 @@ Pin the action by commit SHA. Moving to a new KiCad is a change of `version` in 
 3. for whatever the store does not hold (no release with that key, or a package it lacks), fetches the file from
    Launchpad's file store instead (`launchpad.net/~kicad/.../+files`, with the SHA-256 Launchpad's API gives) and
    prints a warning. That is a different server from the PPA's download server, and the job carries on;
-4. puts the release's **dependency bundle** into apt's download cache: the Ubuntu packages KiCad depends on
-   (about 100, from Ubuntu's own archive, not the PPA), as the store last downloaded them;
+4. unpacks the release's **dependency bundle**: the Ubuntu packages KiCad depends on (about 100, from Ubuntu's
+   own archive, not the PPA), as the store last downloaded them. After `apt-get update`, the files that apt is
+   about to download and whose SHA-256 is the one in apt's own signed index go into apt's download cache
+   (`kicad_cache.py stage`); nothing else from the bundle is used;
 5. installs the files with `apt-get install --no-install-recommends`. apt resolves the dependencies itself and
-   checks every cached file against its own index, so it downloads only what the bundle lacks or what Ubuntu has
-   updated since. That download has a time limit of five minutes and is tried four times;
+   downloads only what the bundle lacks or what Ubuntu has updated since. That download has a time limit of five
+   minutes and is tried four times;
 6. checks that the installed packages are the version asked for.
 
 The PPA's download server and `add-apt-repository` are not used anywhere.
@@ -84,9 +86,10 @@ version is superseded.
 ## What to know
 
 - **Why the dependencies are bundled.** A runner's Ubuntu mirror is normally quick, but it has been seen to
-  crawl: on 2026-11-18 two jobs spent 20 minutes on KiCad's dependencies and were cancelled. The bundle is only
-  food for apt's cache. It cannot install a wrong package (apt verifies each file), and a job without it, or with
-  a stale one, only downloads more. `apt-get update` still asks the Ubuntu mirror for its index.
+  crawl: on 2026-11-18 several jobs spent 20 minutes on KiCad's dependencies and were cancelled. The bundle is
+  only food for apt's cache. apt itself checks no more than the size of a file it finds in its cache, so the
+  action checks each one against the SHA-256 in apt's index first; a job without a bundle, or with a stale or
+  damaged one, only downloads more. `apt-get update` still asks the Ubuntu mirror for its index.
 - **The bundle is made on GitHub's `ubuntu-24.04` runner** and holds what that image lacks. A job on a different
   image (a bare container, say) needs more than it holds and downloads the rest.
 - **Ubuntu only.** These are the PPA's packages. Jobs that run in the `kicad/kicad` Docker image do not use the
@@ -106,7 +109,7 @@ version is superseded.
 | Path | What |
 |---|---|
 | `action.yml` | the action a job uses |
-| `tools/kicad_cache.py` | everything else: `get`, `store`, `check`, `key` (Python 3.9+, standard library; `store` needs `gh`) |
+| `tools/kicad_cache.py` | everything else: `get`, `stage`, `store`, `check`, `key` (Python 3.9+, standard library; `store` needs `gh`) |
 | `store.json` | which series, Ubuntu releases and packages are stored |
 | `.github/workflows/store.yml` | fills the store |
 | `.github/workflows/ci.yml` | the tests, and the action on a real runner (installs KiCad, runs `kicad-cli` and `pcbnew`, and reports whether the store was hit and how many dependencies came from it) |
