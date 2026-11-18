@@ -1,0 +1,42 @@
+# Fills the store: finds the KiCad the PPA publishes now for every target in store.json and, if there is no release
+# with its key yet, downloads its packages once (from Launchpad's file store) and publishes them as that release.
+# A published release is never changed. Runs four times a day, when store.json changes, and by hand:
+#   Actions > Store KiCad packages > Run workflow        (optionally with a KiCad version Launchpad still has)
+name: Store KiCad packages
+
+on:
+  schedule:
+    - cron: "23 1,7,13,19 * * *"
+  push:
+    branches: [main]
+    paths: [store.json, tools/kicad_cache.py, .github/workflows/store.yml]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: KiCad version to store (empty = the newest the PPA publishes)
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: store
+  cancel-in-progress: false
+
+jobs:
+  store:
+    name: Store
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - name: Store what is not stored yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KICAD_VERSION: ${{ inputs.version }}
+        run: |
+          set -o pipefail          # the tool's exit code, not tee's
+          set -- store --config store.json --repo "$GITHUB_REPOSITORY" --work "$RUNNER_TEMP/kicad-store"
+          if [ -n "$KICAD_VERSION" ]; then set -- "$@" --version "$KICAD_VERSION"; fi
+          python3 tools/kicad_cache.py "$@" | tee -a "$GITHUB_STEP_SUMMARY"

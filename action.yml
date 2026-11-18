@@ -1,0 +1,68 @@
+name: Set up KiCad from the package store
+description: >
+  Installs one exact KiCad version on an Ubuntu runner from the .deb files stored as release assets of
+  lfarrand/kicad-packages (key kicad-<version>-ubuntu<release>-<arch>). What the store does not hold is fetched
+  from Launchpad's file store instead. The KiCad PPA's download server is never used.
+
+inputs:
+  version:
+    description: The KiCad version, in full (for example 10.0.8)
+    required: true
+  packages:
+    description: Packages to install, separated by spaces (for example "kicad kicad-demos")
+    default: kicad
+  repository:
+    description: The repository whose releases hold the packages
+    default: lfarrand/kicad-packages
+  fallback:
+    description: "'false' fails the job on a store miss instead of fetching from Launchpad"
+    default: 'true'
+
+outputs:
+  cache-hit:
+    description: "'true' every package came from the store, 'partial' some did, 'false' none did"
+    value: ${{ steps.get.outputs.cache-hit }}
+  key:
+    description: The version key (the release tag), for example kicad-10.0.8-ubuntu24.04-amd64
+    value: ${{ steps.get.outputs.key }}
+
+runs:
+  using: composite
+  steps:
+    - name: Fetch the KiCad packages
+      id: get
+      shell: bash
+      # inputs reach the script through the environment, never by ${{ }} inside it
+      env:
+        KICAD_VERSION: ${{ inputs.version }}
+        KICAD_PACKAGES: ${{ inputs.packages }}
+        KICAD_STORE: ${{ inputs.repository }}
+        KICAD_FALLBACK: ${{ inputs.fallback }}
+      run: |
+        dest="${RUNNER_TEMP:-/tmp}/kicad-packages-$$"
+        echo "KICAD_DEBS=$dest" >> "$GITHUB_ENV"
+        set -- get --version "$KICAD_VERSION" --packages "$KICAD_PACKAGES" --repo "$KICAD_STORE" \
+          --dest "$dest" --github-output "$GITHUB_OUTPUT"
+        if [ "$KICAD_FALLBACK" = false ]; then set -- "$@" --no-fallback; fi
+        python3 "$GITHUB_ACTION_PATH/tools/kicad_cache.py" "$@"
+    - name: Install KiCad
+      shell: bash
+      # KiCad's own dependencies come from Ubuntu's archive (not the PPA); that is tried again too
+      run: |
+        if [ "$(id -u)" = 0 ]; then SUDO=""; else SUDO=sudo; fi
+        for attempt in 1 2 3 4; do
+          if $SUDO apt-get -o Acquire::Retries=5 update &&
+             $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y \
+               --no-install-recommends "$KICAD_DEBS"/*.deb; then
+            exit 0
+          fi
+          if [ "$attempt" -lt 4 ]; then echo "apt-get failed (attempt $attempt of 4), trying again in 30 s"; sleep 30; fi
+        done
+        echo "::error::installing the KiCad packages failed after 4 attempts"
+        exit 1
+    - name: The KiCad installed is the one asked for
+      shell: bash
+      env:
+        KICAD_VERSION: ${{ inputs.version }}
+        KICAD_PACKAGES: ${{ inputs.packages }}
+      run: python3 "$GITHUB_ACTION_PATH/tools/kicad_cache.py" check --version "$KICAD_VERSION" --packages "$KICAD_PACKAGES"

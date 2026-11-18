@@ -1,0 +1,15 @@
+{
+  "series": ["10.0"],
+  "targets": [
+    {"ubuntu": "24.04", "codename": "noble", "arch": "amd64"}
+  ],
+  "packages": [
+    "kicad",
+    "kicad-demos",
+    "kicad-symbols",
+    "kicad-footprints",
+    "kicad-templates",
+    "kicad-packages3d",
+    "kicad-libraries"
+  ]
+}
