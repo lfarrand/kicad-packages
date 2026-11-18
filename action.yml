@@ -47,18 +47,26 @@ runs:
         python3 "$GITHUB_ACTION_PATH/tools/kicad_cache.py" "$@"
     - name: Install KiCad
       shell: bash
-      # KiCad's own dependencies come from Ubuntu's archive (not the PPA); that is tried again too
+      # KiCad's dependencies (about 100 packages) come from Ubuntu's own archive, not the PPA. A runner's Ubuntu
+      # mirror is sometimes so slow that this alone outlasts the job, so the download is a step of its own with a
+      # time limit, tried again (apt keeps what it already has); the install after it needs no network, and is
+      # never interrupted.
       run: |
         if [ "$(id -u)" = 0 ]; then SUDO=""; else SUDO=sudo; fi
+        apt_get() { $SUDO env DEBIAN_FRONTEND=noninteractive timeout --kill-after=30 "$1" apt-get \
+          -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "${@:2}"; }
         for attempt in 1 2 3 4; do
-          if $SUDO apt-get -o Acquire::Retries=5 update &&
-             $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y \
-               --no-install-recommends "$KICAD_DEBS"/*.deb; then
+          if apt_get 180 update &&
+             apt_get 300 install -y --no-install-recommends --download-only "$KICAD_DEBS"/*.deb; then
+            $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$KICAD_DEBS"/*.deb
             exit 0
           fi
-          if [ "$attempt" -lt 4 ]; then echo "apt-get failed (attempt $attempt of 4), trying again in 30 s"; sleep 30; fi
+          if [ "$attempt" -lt 4 ]; then
+            echo "fetching KiCad's dependencies from Ubuntu's archive failed or took too long (attempt $attempt of 4), trying again in 30 s"
+            sleep 30
+          fi
         done
-        echo "::error::installing the KiCad packages failed after 4 attempts"
+        echo "::error::KiCad's dependencies could not be fetched from Ubuntu's archive in 4 attempts"
         exit 1
     - name: The KiCad installed is the one asked for
       shell: bash

@@ -54,8 +54,14 @@ def test_the_action_passes_every_input_on_and_declares_its_outputs():
     assert set(action["outputs"]) == {"cache-hit", "key"}
     for name in action["outputs"]:
         assert action["outputs"][name]["value"] == "${{ steps.get.outputs.%s }}" % name
-    assert "--no-install-recommends" in install["run"] and '"$KICAD_DEBS"/*.deb' in install["run"]
-    assert "exit 1" in install["run"]
+    script = install["run"]
+    assert script.count("--no-install-recommends") == 2 and script.count('"$KICAD_DEBS"/*.deb') == 2
+    # the downloads have a time limit and are tried again; the install itself is never cut short
+    download = script.index("apt_get 300 install -y --no-install-recommends --download-only")
+    final = script.index("apt-get install -y --no-install-recommends", download + 20)
+    assert "timeout" not in script[final - 60:final] and script.index("exit 0") > final
+    assert "timeout --kill-after=30" in script and "apt_get 180 update" in script
+    assert script.rstrip().endswith("exit 1")
     assert "check --version" in check["run"]
 
 

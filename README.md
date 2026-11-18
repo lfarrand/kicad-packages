@@ -48,8 +48,9 @@ Pin the action by commit SHA. Moving to a new KiCad is a change of `version` in 
 3. for whatever the store does not hold (no release with that key, or a package it lacks), fetches the file from
    Launchpad's file store instead (`launchpad.net/~kicad/.../+files`, with the SHA-256 Launchpad's API gives) and
    prints a warning. That is a different server from the PPA's download server, and the job carries on;
-4. installs the files with `apt-get install --no-install-recommends`, so KiCad's dependencies come from Ubuntu's
-   own archive, and checks that the installed packages are the version asked for.
+4. installs the files with `apt-get install --no-install-recommends`, so KiCad's dependencies (about 100
+   packages, 110 MB) come from Ubuntu's own archive, and checks that the installed packages are the version asked
+   for. The download of the dependencies has a time limit of five minutes and is tried four times.
 
 The PPA's download server and `add-apt-repository` are not used anywhere.
 
@@ -75,6 +76,9 @@ version is superseded.
 
 ## What to know
 
+- **KiCad's dependencies are not stored**, only KiCad's own packages. They come from the runner's Ubuntu mirror,
+  which is normally quick (the whole install takes about 30 seconds) but has been seen to crawl: one run here
+  needed 20 minutes for them and was cancelled, which is why the download now has a time limit and is retried.
 - **Ubuntu only.** These are the PPA's packages. Jobs that run in the `kicad/kicad` Docker image do not use the
   PPA and do not need this.
 - **Runner image.** The key carries the Ubuntu release, so a job on `ubuntu-26.04` needs a `26.04` target in
