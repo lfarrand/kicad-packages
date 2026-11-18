@@ -1,6 +1,7 @@
 # Fills the store: finds the KiCad the PPA publishes now for every target in store.json and, if there is no release
 # with its key yet, downloads its packages once (from Launchpad's file store) and publishes them as that release.
-# A published release is never changed. Runs four times a day, when store.json changes, and by hand:
+# The KiCad packages of a published release are never changed. Then it rebuilds the dependency bundle (the Ubuntu
+# packages KiCad needs, for apt's cache) of every stored version whose bundle is over a week old. Runs four times a day, when store.json changes, and by hand:
 #   Actions > Store KiCad packages > Run workflow        (optionally with a KiCad version Launchpad still has)
 name: Store KiCad packages
 

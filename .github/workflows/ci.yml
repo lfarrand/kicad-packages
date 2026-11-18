@@ -36,8 +36,9 @@ jobs:
         env:
           HIT: ${{ steps.kicad.outputs.cache-hit }}
           KEY: ${{ steps.kicad.outputs.key }}
+          DEPENDENCIES: ${{ steps.kicad.outputs.dependencies }}
         run: |
-          echo "store hit: $HIT ($KEY)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "store hit: $HIT ($KEY), dependencies from the store: $DEPENDENCIES" | tee -a "$GITHUB_STEP_SUMMARY"
           test "$KEY" = kicad-10.0.8-ubuntu24.04-amd64
           kicad-cli version | tee -a "$GITHUB_STEP_SUMMARY"
           kicad-cli version | grep -q "^10\.0\.8"

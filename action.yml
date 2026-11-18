@@ -17,6 +17,9 @@ inputs:
   fallback:
     description: "'false' fails the job on a store miss instead of fetching from Launchpad"
     default: 'true'
+  dependencies:
+    description: "'false' leaves the stored copies of KiCad's Ubuntu dependencies unused: apt downloads them all"
+    default: 'true'
 
 outputs:
   cache-hit:
@@ -25,6 +28,9 @@ outputs:
   key:
     description: The version key (the release tag), for example kicad-10.0.8-ubuntu24.04-amd64
     value: ${{ steps.get.outputs.key }}
+  dependencies:
+    description: How many of KiCad's Ubuntu dependencies were taken from the store (0 when none)
+    value: ${{ steps.get.outputs.dependencies }}
 
 runs:
   using: composite
@@ -38,21 +44,28 @@ runs:
         KICAD_PACKAGES: ${{ inputs.packages }}
         KICAD_STORE: ${{ inputs.repository }}
         KICAD_FALLBACK: ${{ inputs.fallback }}
+        KICAD_DEPENDENCIES: ${{ inputs.dependencies }}
       run: |
         dest="${RUNNER_TEMP:-/tmp}/kicad-packages-$$"
         echo "KICAD_DEBS=$dest" >> "$GITHUB_ENV"
+        echo "KICAD_DEPS=$dest-dependencies" >> "$GITHUB_ENV"
         set -- get --version "$KICAD_VERSION" --packages "$KICAD_PACKAGES" --repo "$KICAD_STORE" \
           --dest "$dest" --github-output "$GITHUB_OUTPUT"
         if [ "$KICAD_FALLBACK" = false ]; then set -- "$@" --no-fallback; fi
+        if [ "$KICAD_DEPENDENCIES" != false ]; then set -- "$@" --dependencies-dest "$dest-dependencies"; fi
         python3 "$GITHUB_ACTION_PATH/tools/kicad_cache.py" "$@"
     - name: Install KiCad
       shell: bash
-      # KiCad's dependencies (about 100 packages) come from Ubuntu's own archive, not the PPA. A runner's Ubuntu
-      # mirror is sometimes so slow that this alone outlasts the job, so the download is a step of its own with a
-      # time limit, tried again (apt keeps what it already has); the install after it needs no network, and is
-      # never interrupted.
+      # KiCad's dependencies (about 100 Ubuntu packages) are not the PPA's: apt resolves them. The copies the
+      # store holds go into apt's download cache first; apt checks each against its own index and downloads only
+      # what is missing or has changed since. A runner's Ubuntu mirror is sometimes so slow that this alone
+      # outlasts a job, so that download is a step of its own with a time limit, tried again (apt keeps what it
+      # already has); the install after it needs no network, and is never interrupted.
       run: |
         if [ "$(id -u)" = 0 ]; then SUDO=""; else SUDO=sudo; fi
+        if compgen -G "$KICAD_DEPS/*.deb" > /dev/null; then
+          $SUDO cp "$KICAD_DEPS"/*.deb /var/cache/apt/archives/
+        fi
         apt_get() { $SUDO env DEBIAN_FRONTEND=noninteractive timeout --kill-after=30 "$1" apt-get \
           -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "${@:2}"; }
         for attempt in 1 2 3 4; do

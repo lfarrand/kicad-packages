@@ -16,16 +16,23 @@ public GitHub repository, named by a version key:
   check   fails unless the installed packages are the KiCad version asked for.
   key     prints the version key for this machine.
 
-A published release is never changed. Python 3.9 or later, standard library only; `store` also
+The KiCad packages of a published release are never changed. Beside them the store keeps the Ubuntu
+packages KiCad depends on (about 100, from Ubuntu's own archive) as one bundle per release, refreshed
+weekly: `get` unpacks it for apt's download cache, so that an install does not wait for a slow Ubuntu
+mirror. apt checks every cached file against its own index, so a stale bundle only costs a download.
+
+Python 3.9 or later, standard library only; `store` also
 needs the GitHub CLI (`gh`) with a token that can write releases.
 """
 import argparse
+import datetime
 import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.error
 import urllib.parse
@@ -41,6 +48,10 @@ REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 WORD_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.]*$")
 ASSET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.deb$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+DEPS_INDEX = "dependencies.json"
+DEPS_ASSET_RE = re.compile(r"^dependencies-\d{12}\.tar$")
+DEPS_MEMBER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+._%~-]*\.deb$")     # a file name as apt writes it
+DEPS_MAX_AGE_DAYS = 7
 # which publication of a version to take when Launchpad lists several
 STATUS_ORDER = {"Published": 0, "Pending": 1, "Superseded": 2, "Obsolete": 3, "Deleted": 4}
 
@@ -290,6 +301,68 @@ def cache_manifest(repo, key, net):
     return manifest
 
 
+def deps_index(repo, key, net):
+    """the index of a release's dependency bundle {asset, sha256, size, count, created}, or None if it has none"""
+    try:
+        index = net.read_json(asset_url(repo, key, DEPS_INDEX))
+    except NotFound:
+        return None
+    ok = (isinstance(index, dict) and DEPS_ASSET_RE.match(str(index.get("asset")))
+          and SHA256_RE.match(str(index.get("sha256"))) and isinstance(index.get("size"), int)
+          and isinstance(index.get("created"), str))
+    if not ok:
+        raise CacheError("the dependency index of %s in %s is malformed" % (key, repo))
+    return index
+
+
+def unpack_debs(tar_path, dest):
+    """Extract the .deb files of a bundle into dest, by plain file name only; the number extracted.
+    Anything that is not a regular file with an apt file name is an error: nothing else belongs in a bundle."""
+    count = 0
+    try:
+        with tarfile.open(tar_path, "r:") as tar:
+            for member in tar:
+                if not member.isfile() or not DEPS_MEMBER_RE.match(member.name):
+                    raise CacheError("unexpected entry in the dependency bundle: %r" % (member.name,))
+                with tar.extractfile(member) as src, open(os.path.join(dest, member.name), "wb") as out:
+                    while True:
+                        block = src.read(1 << 20)
+                        if not block:
+                            break
+                        out.write(block)
+                count += 1
+    except (tarfile.TarError, OSError) as e:
+        raise CacheError("the dependency bundle cannot be read: %s" % e)
+    return count
+
+
+def get_dependencies(repo, key, dest, net, log=print):
+    """Put the stored dependency packages of the release `key` into dest, for apt's download cache.
+    The number of files; 0, with a warning at most, when there is no usable bundle: apt then downloads
+    them itself, so this never fails a job."""
+    os.makedirs(dest, exist_ok=True)
+    if os.listdir(dest):
+        log("::warning::%s is not empty: KiCad's stored dependencies are not used" % dest)
+        return 0
+    tar_path = os.path.join(dest, "bundle.tar")
+    try:
+        index = deps_index(repo, key, net)
+        if index is None:
+            return 0
+        net.download(asset_url(repo, key, index["asset"]), tar_path, index["sha256"], index["size"])
+        count = unpack_debs(tar_path, dest)
+    except CacheError as e:
+        log("::warning::KiCad's stored dependencies could not be used (%s): apt downloads them instead" % e)
+        for name in os.listdir(dest):
+            os.remove(os.path.join(dest, name))
+        return 0
+    finally:
+        if os.path.exists(tar_path):
+            os.remove(tar_path)
+    log("%d dependency package(s) from the store (%s, bundled %s)" % (count, key, index["created"]))
+    return count
+
+
 def get(version, packages, ubuntu, codename, arch, repo, dest, net, fallback=True, log=print):
     """Put the .deb files of `packages` at KiCad `version` into dest: from the store, and whatever the store
     does not hold from Launchpad (unless fallback is off). {key, cache-hit: true|partial|false, files}."""
@@ -381,6 +454,110 @@ def release_notes(manifest):
     return "\n".join(lines) + "\n"
 
 
+def utc_now():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def deps_are_fresh(index, now, max_age_days=DEPS_MAX_AGE_DAYS):
+    """True when a dependency index is younger than max_age_days (an unreadable date is not fresh)"""
+    try:
+        created = datetime.datetime.fromisoformat(index["created"])
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=datetime.timezone.utc)
+    except (KeyError, TypeError, ValueError):
+        return False
+    return datetime.timedelta(0) <= now - created < datetime.timedelta(days=max_age_days)
+
+
+def build_deps_bundle(debs, folder, run, now, root=None):
+    """Let apt download what the .deb files depend on (on this machine, without installing anything) and pack it.
+    (path of the tar, its index). Needs apt-get, and sudo when not root."""
+    archives = os.path.join(folder, "apt-archives")
+    os.makedirs(os.path.join(archives, "partial"), exist_ok=True)
+    sudo = [] if (os.geteuid() == 0 if root is None else root) else ["sudo"]
+    for what, argv in (
+            ("apt-get update", ["timeout", "600", "apt-get", "-o", "Acquire::Retries=5", "update"]),
+            ("apt-get install --download-only", [
+                "timeout", "1800", "apt-get", "-o", "Acquire::Retries=5", "-o", "Dir::Cache::archives=" + archives,
+                "install", "-y", "--no-install-recommends", "--download-only"] + [os.path.abspath(d) for d in debs])):
+        try:
+            code, out, err = run(sudo + argv)
+        except OSError as e:
+            raise CacheError("cannot run %s: %s" % (what, e))
+        if code != 0:
+            raise CacheError("%s failed (exit %d): %s" % (what, code, (err or out).strip()[-400:]))
+    names = sorted(n for n in os.listdir(archives) if DEPS_MEMBER_RE.match(n) and os.path.isfile(os.path.join(archives, n)))
+    if not names:
+        raise CacheError("apt downloaded no dependencies: refusing to publish an empty bundle")
+    asset = "dependencies-%s.tar" % now.strftime("%Y%m%d%H%M")
+    path = os.path.join(folder, asset)
+    with tarfile.open(path, "w:") as tar:          # not compressed: .deb files already are
+        for name in names:
+            info = tar.gettarinfo(os.path.join(archives, name), arcname=name)
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            info.mode = 0o644
+            with open(os.path.join(archives, name), "rb") as f:
+                tar.addfile(info, f)
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return path, {"schema": 1, "asset": asset, "sha256": digest.hexdigest(), "size": os.path.getsize(path),
+                  "count": len(names), "created": now.replace(microsecond=0).isoformat()}
+
+
+def refresh_dependencies(repo, key, manifest, folder, net, run, now, log=print):
+    """Publish a new dependency bundle for the release `key` unless the one it has is fresh. The KiCad packages
+    are taken from the folder if they are there, otherwise from the store. True when a bundle was published."""
+    try:
+        index = deps_index(repo, key, net)
+    except CacheError as e:
+        log("%s: replacing the dependency bundle (%s)" % (key, e))
+        index = None
+    if index is not None and deps_are_fresh(index, now):
+        log("%s: dependencies bundled %s, still fresh" % (key, index["created"]))
+        return False
+    os.makedirs(folder, exist_ok=True)
+    debs = []
+    for name in sorted(manifest["packages"]):
+        entry = check_entry(name, manifest["packages"][name])
+        path = os.path.join(folder, entry["asset"])
+        if not os.path.exists(path):
+            net.download(asset_url(repo, key, entry["asset"]), path, entry["sha256"], entry.get("size"))
+        debs.append(path)
+    tar_path, new = build_deps_bundle(debs, folder, run, now)
+    gh(run, "release", "upload", key, "--repo", repo, "--clobber", tar_path)
+    index_path = os.path.join(folder, DEPS_INDEX)
+    with open(index_path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(new, f, indent=2, sort_keys=True)
+        f.write("\n")
+    gh(run, "release", "upload", key, "--repo", repo, "--clobber", index_path)      # the index last: it names the tar
+    try:
+        assets = json.loads(gh(run, "release", "view", key, "--repo", repo, "--json", "assets"))["assets"]
+        old = [a["name"] for a in assets if DEPS_ASSET_RE.match(str(a.get("name"))) and a["name"] != new["asset"]]
+    except (ValueError, KeyError, TypeError) as e:
+        raise CacheError("gh release view %s gave no asset list: %r" % (key, e))
+    for name in old:
+        gh(run, "release", "delete-asset", key, name, "--repo", repo, "--yes")
+    log("%s: %d dependency packages bundled (%s)" % (key, new["count"], new["asset"]))
+    return True
+
+
+def stored_keys(repo, wanted, run):
+    """the release tags of the repository that are version keys of the configured series and targets, sorted"""
+    try:
+        tags = [r["tagName"] for r in json.loads(gh(run, "release", "list", "--repo", repo, "--limit", "1000",
+                                                    "--json", "tagName"))]
+    except (ValueError, KeyError, TypeError) as e:
+        raise CacheError("gh release list gave no list of tags: %r" % (e,))
+    keys = set()
+    for series, ubuntu, _, arch in wanted:
+        pattern = re.compile(r"^kicad-%s\.\d+-ubuntu%s-%s$" % (re.escape(series), re.escape(ubuntu), re.escape(arch)))
+        keys.update(t for t in tags if isinstance(t, str) and pattern.match(t))
+    return sorted(keys)
+
+
 def targets(config):
     """[(series, ubuntu, codename, arch)] and the package list of a store configuration"""
     try:
@@ -399,9 +576,11 @@ def targets(config):
     return out, packages
 
 
-def store(config, repo, work, net, run=run_command, version=None, log=print):
+def store(config, repo, work, net, run=run_command, version=None, log=print, now=None, dependencies=True):
     """For every target of the configuration: the PPA's current KiCad (or `version`), stored as a release
-    unless a release with its key and a manifest is already there. [(key, "stored" | "already stored")]."""
+    unless a release with its key and a manifest is already there; then that release's dependency bundle,
+    unless it is fresh. [(key, "stored" | "already stored")]."""
+    now = now or utc_now()
     check_repo(repo)
     if version is not None:
         check_version(version)
@@ -414,11 +593,14 @@ def store(config, repo, work, net, run=run_command, version=None, log=print):
         if v is None:
             raise CacheError("the KiCad %s PPA publishes no kicad for Ubuntu %s %s" % (series, codename, arch))
         key = release_key(v, ubuntu, arch)
-        if cache_manifest(repo, key, net) is not None:
+        folder = os.path.join(work, key)
+        manifest = cache_manifest(repo, key, net)
+        if manifest is not None:
             log("%s: already stored" % key)
             done.append((key, "already stored"))
+            if dependencies:
+                refresh_dependencies(repo, key, manifest, folder, net, run, now, log)
             continue
-        folder = os.path.join(work, key)
         os.makedirs(folder, exist_ok=True)
         manifest = build_manifest(v, ubuntu, codename, arch, lp_fetch(v, codename, arch, packages, folder, net))
         debs = [os.path.join(folder, manifest["packages"][name]["asset"]) for name in packages]
@@ -438,8 +620,18 @@ def store(config, repo, work, net, run=run_command, version=None, log=print):
         gh(run, "release", "upload", key, "--repo", repo, "--clobber", path)
         log("%s: stored (%s)" % (key, " ".join(packages)))
         done.append((key, "stored"))
+        if dependencies:
+            refresh_dependencies(repo, key, manifest, folder, net, run, now, log)
     if not done:
         raise CacheError("the store configuration has no series %s" % series_of(version))
+    if dependencies and version is None:
+        # the versions stored earlier are still installed by jobs that pin them: keep their bundles fresh too
+        current = {key for key, _ in done}
+        for key in stored_keys(repo, wanted, run):
+            if key not in current:
+                manifest = cache_manifest(repo, key, net)
+                if manifest is not None:
+                    refresh_dependencies(repo, key, manifest, os.path.join(work, key), net, run, now, log)
     return done
 
 
@@ -500,12 +692,14 @@ def main(argv=None, net=None, run=run_command, out=print):
     g.add_argument("--repo", default=DEFAULT_REPO)
     g.add_argument("--dest", required=True, help="empty folder for the .deb files")
     g.add_argument("--no-fallback", action="store_true", help="fail on a store miss instead of asking Launchpad")
-    g.add_argument("--github-output", help="file to append key= and cache-hit= to ($GITHUB_OUTPUT)")
+    g.add_argument("--github-output", help="file to append key=, cache-hit= and dependencies= to ($GITHUB_OUTPUT)")
+    g.add_argument("--dependencies-dest", help="empty folder for the stored dependency packages (apt's cache food)")
     s = sub.add_parser("store", help="store the PPA's current KiCad as a release, unless it is there already")
     s.add_argument("--config", required=True, help="store.json")
     s.add_argument("--repo", default=DEFAULT_REPO)
     s.add_argument("--work", required=True, help="folder for the downloads")
     s.add_argument("--version", help="store this KiCad version instead of the newest (if Launchpad still has it)")
+    s.add_argument("--no-dependencies", action="store_true", help="leave the dependency bundles alone")
     c = sub.add_parser("check", help="fail unless the installed packages are this KiCad version")
     c.add_argument("--version", required=True)
     c.add_argument("--packages", default="kicad")
@@ -528,9 +722,12 @@ def main(argv=None, net=None, run=run_command, out=print):
             ubuntu, codename, arch = target()
             result = get(args.version, names(args.packages), ubuntu, codename, arch, args.repo, args.dest, net,
                          fallback=not args.no_fallback, log=out)
+            count = 0
+            if args.dependencies_dest:
+                count = get_dependencies(args.repo, result["key"], args.dependencies_dest, net, log=out)
             if args.github_output:
                 with open(args.github_output, "a", encoding="utf-8") as f:
-                    f.write("key=%s\ncache-hit=%s\n" % (result["key"], result["cache-hit"]))
+                    f.write("key=%s\ncache-hit=%s\ndependencies=%d\n" % (result["key"], result["cache-hit"], count))
             out("%s: %d package file(s) in %s (store hit: %s)"
                 % (result["key"], len(result["files"]), args.dest, result["cache-hit"]))
         elif args.command == "store":
@@ -539,7 +736,8 @@ def main(argv=None, net=None, run=run_command, out=print):
                     config = json.load(f)
             except (OSError, ValueError) as e:
                 raise CacheError("cannot read %s: %s" % (args.config, e))
-            store(config, args.repo, args.work, net, run=run, version=args.version or None, log=out)
+            store(config, args.repo, args.work, net, run=run, version=args.version or None, log=out,
+                  dependencies=not args.no_dependencies)
         elif args.command == "check":
             check_installed(args.version, names(args.packages), run)
             out("KiCad %s is installed (%s)" % (args.version, " ".join(names(args.packages))))

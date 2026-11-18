@@ -47,14 +47,19 @@ def test_the_action_passes_every_input_on_and_declares_its_outputs():
     get, install, check = action["runs"]["steps"]
     assert get["id"] == "get" and all(s["shell"] == "bash" for s in (get, install, check))
     assert get["env"] == {"KICAD_VERSION": "${{ inputs.version }}", "KICAD_PACKAGES": "${{ inputs.packages }}",
-                          "KICAD_STORE": "${{ inputs.repository }}", "KICAD_FALLBACK": "${{ inputs.fallback }}"}
+                          "KICAD_STORE": "${{ inputs.repository }}", "KICAD_FALLBACK": "${{ inputs.fallback }}",
+                          "KICAD_DEPENDENCIES": "${{ inputs.dependencies }}"}
     for word in ('--version "$KICAD_VERSION"', '--packages "$KICAD_PACKAGES"', '--repo "$KICAD_STORE"',
-                 '--github-output "$GITHUB_OUTPUT"', "--no-fallback", "$GITHUB_ACTION_PATH/tools/kicad_cache.py"):
+                 '--github-output "$GITHUB_OUTPUT"', "--no-fallback", "$GITHUB_ACTION_PATH/tools/kicad_cache.py",
+                 '--dependencies-dest "$dest-dependencies"', 'KICAD_DEPS=$dest-dependencies'):
         assert word in get["run"], word
-    assert set(action["outputs"]) == {"cache-hit", "key"}
+    assert set(action["outputs"]) == {"cache-hit", "key", "dependencies"}
+    assert set(action["inputs"]) == {"version", "packages", "repository", "fallback", "dependencies"}
     for name in action["outputs"]:
         assert action["outputs"][name]["value"] == "${{ steps.get.outputs.%s }}" % name
     script = install["run"]
+    # the stored dependencies go into apt's cache before apt is asked for anything
+    assert script.index('cp "$KICAD_DEPS"/*.deb /var/cache/apt/archives/') < script.index("apt_get 180 update")
     assert script.count("--no-install-recommends") == 2 and script.count('"$KICAD_DEBS"/*.deb') == 2
     # the downloads have a time limit and are tried again; the install itself is never cut short
     download = script.index("apt_get 300 install -y --no-install-recommends --download-only")

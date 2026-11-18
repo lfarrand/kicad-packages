@@ -1,8 +1,10 @@
 """kicad_cache.py against a made-up Launchpad and a made-up GitHub: no test touches the network."""
+import datetime
 import hashlib
 import io
 import json
 import os
+import tarfile
 import urllib.error
 
 import pytest
@@ -411,12 +413,41 @@ CONFIG = {"series": ["10.0"], "targets": [{"ubuntu": "24.04", "codename": "noble
 class Gh:
     """gh stand-in: records every call; `release view` answers from self.exists"""
 
-    def __init__(self, exists=False, fail=None, view=None):
+    def __init__(self, exists=False, fail=None, view=None, apt_files=("libfoo_1.0_amd64.deb", "libbar_1%3a2.0-1_all.deb"),
+                 apt_fail=None, assets=(), tags=()):
+        self.tags = tags
         self.calls, self.exists, self.fail, self.view = [], exists, fail, view
+        self.apt_calls, self.apt_files, self.apt_fail, self.assets = [], apt_files, apt_fail, list(assets)
+
+    def apt(self, argv):
+        """apt-get stand-in: `install --download-only` writes self.apt_files into the archives folder it is given"""
+        self.apt_calls.append(argv)
+        if isinstance(self.apt_fail, Exception):
+            raise self.apt_fail
+        assert "apt-get" in argv and argv[argv.index("apt-get") - 2] == "timeout"
+        if self.apt_fail and self.apt_fail in argv:
+            return 100, "", "E: mirror is down"
+        if "install" in argv:
+            assert "--download-only" in argv and "--no-install-recommends" in argv
+            archives = [a for a in argv if a.startswith("Dir::Cache::archives=")][0].split("=", 1)[1]
+            assert os.path.isdir(os.path.join(archives, "partial"))
+            for path in [a for a in argv if a.endswith(".deb")]:
+                assert os.path.isabs(path) and os.path.isfile(path), path
+            for name in self.apt_files:
+                with open(os.path.join(archives, name), "wb") as f:
+                    f.write(b"dependency " + name.encode())
+            open(os.path.join(archives, "lock"), "w").close()
+        return 0, "", ""
 
     def __call__(self, argv):
+        if argv[0] != "gh":
+            return self.apt(argv)
         self.calls.append(argv)
-        assert argv[0] == "gh" and argv[1] == "release"
+        assert argv[1] == "release"
+        if argv[2] == "list":
+            return 0, self.tags if isinstance(self.tags, str) else json.dumps([{"tagName": t} for t in self.tags]), ""
+        if argv[2] == "view" and "assets" in argv:
+            return 0, json.dumps({"assets": [{"name": n} for n in self.assets]}), ""
         if argv[2] == "view":
             if self.view:
                 return self.view
@@ -430,6 +461,7 @@ class Gh:
 
 def run_store(tmp_path, pages, gh, **kw):
     log = []
+    kw.setdefault("dependencies", False)
     done = kc.store(kw.pop("config", CONFIG), REPO, str(tmp_path / "work"), net_for(Web(pages)), run=gh,
                     log=log.append, **kw)
     return done, log
@@ -627,7 +659,7 @@ def test_cli_get_writes_the_outputs(tmp_path):
                      "--os-release", os_release(tmp_path), "--github-output", str(output)],
                     github({"kicad": (V, KICAD), "kicad-demos": (V, DEMOS)}))
     assert code == 0 and out[-1] == "%s: 2 package file(s) in %s (store hit: true)" % (KEY, tmp_path / "d")
-    assert output.read_text() == "earlier=1\nkey=%s\ncache-hit=true\n" % KEY
+    assert output.read_text() == "earlier=1\nkey=%s\ncache-hit=true\ndependencies=0\n" % KEY
 
 
 def test_cli_get_with_the_target_given_does_not_ask_the_machine(tmp_path):
@@ -664,13 +696,13 @@ def test_cli_store(tmp_path):
     config = tmp_path / "store.json"
     config.write_text(json.dumps(CONFIG))
     gh = Gh()
-    code, out = cli(["store", "--config", str(config), "--work", str(tmp_path / "w")],
+    code, out = cli(["store", "--config", str(config), "--work", str(tmp_path / "w"), "--no-dependencies"],
                     launchpad({"kicad": (V, KICAD), "kicad-demos": (V, DEMOS)}), run=gh)
     assert code == 0 and out == ["%s: stored (kicad kicad-demos)" % KEY]
     assert gh.calls[1][4:6] == ["--repo", kc.DEFAULT_REPO]
     code, out = cli(["store", "--config", str(config), "--work", str(tmp_path / "w2"), "--version", "10.0.8",
                      "--repo", "me/mine"], launchpad({"kicad": (V, KICAD), "kicad-demos": (V, DEMOS)}), run=Gh())
-    assert code == 0
+    assert code == 0 and any("2 dependency packages bundled" in line for line in out)      # bundled by default
 
 
 def test_cli_store_with_a_bad_configuration_file(tmp_path):
@@ -692,3 +724,298 @@ def test_store_series_none_done_is_reported_for_the_asked_version(tmp_path):
     config = dict(CONFIG, series=["9.0"])
     with pytest.raises(kc.CacheError, match="no series 10.0"):
         run_store(tmp_path, {}, Gh(), config=config, version="10.0.8")
+
+
+# ---- the dependency bundle ------------------------------------------------------------------------------------------
+
+NOW = datetime.datetime(2026, 11, 18, 21, 30, 45, 123456, tzinfo=datetime.timezone.utc)
+DEPS_URL = kc.asset_url(REPO, KEY, kc.DEPS_INDEX)
+
+
+def make_tar(tmp_path, members, name="b.tar"):
+    """a tar of {member name: bytes | "dir" | "link"}"""
+    path = str(tmp_path / name)
+    with tarfile.open(path, "w:") as tar:
+        for member, content in members.items():
+            info = tarfile.TarInfo(member)
+            if content == "dir":
+                info.type = tarfile.DIRTYPE
+                tar.addfile(info)
+            elif content == "link":
+                info.type, info.linkname = tarfile.SYMTYPE, "/etc/passwd"
+                tar.addfile(info)
+            else:
+                info.size = len(content)
+                tar.addfile(info, io.BytesIO(content))
+    return path
+
+
+def bundle_pages(tmp_path, members, created="2026-11-18T21:30:45+00:00", **change):
+    data = open(make_tar(tmp_path, members), "rb").read()
+    index = {"schema": 1, "asset": "dependencies-202611182130.tar", "sha256": sha(data), "size": len(data),
+             "count": len(members), "created": created}
+    index.update(change)
+    return {DEPS_URL: json.dumps(index).encode(), kc.asset_url(REPO, KEY, "dependencies-202611182130.tar"): data}
+
+
+def test_unpack_debs(tmp_path):
+    dest = tmp_path / "out"
+    dest.mkdir()
+    path = make_tar(tmp_path, {"libfoo_1.0_amd64.deb": b"foo", "libbar_1%3a2.0-1+b1~x_all.deb": b"bar" * 500000})
+    assert kc.unpack_debs(path, str(dest)) == 2
+    assert (dest / "libfoo_1.0_amd64.deb").read_bytes() == b"foo"
+    assert (dest / "libbar_1%3a2.0-1+b1~x_all.deb").read_bytes() == b"bar" * 500000
+
+
+@pytest.mark.parametrize("members", [
+    {"../evil.deb": b"x"}, {"/etc/evil.deb": b"x"}, {"sub/a.deb": b"x"}, {"a.deb": "dir"}, {"a.deb": "link"},
+    {"readme.txt": b"x"}, {".hidden.deb": b"x"}, {"ok_1_all.deb": b"x", "..\\evil.deb": b"x"}])
+def test_unpack_debs_refuses_anything_but_plain_deb_files(tmp_path, members):
+    dest = tmp_path / "out"
+    dest.mkdir()
+    with pytest.raises(kc.CacheError, match="unexpected entry"):
+        kc.unpack_debs(make_tar(tmp_path, members), str(dest))
+    assert not os.path.exists(str(tmp_path / "evil.deb"))
+
+
+def test_unpack_debs_of_what_is_not_a_tar(tmp_path):
+    bad = tmp_path / "bad.tar"
+    bad.write_bytes(b"<html>503</html>")
+    with pytest.raises(kc.CacheError, match="cannot be read"):
+        kc.unpack_debs(str(bad), str(tmp_path))
+    with pytest.raises(kc.CacheError, match="cannot be read"):
+        kc.unpack_debs(str(tmp_path / "none.tar"), str(tmp_path))
+
+
+def get_deps(tmp_path, pages):
+    log = []
+    dest = tmp_path / "deps"
+    return kc.get_dependencies(REPO, KEY, str(dest), net_for(Web(pages)), log=log.append), log, dest
+
+
+def test_get_dependencies_unpacks_the_bundle(tmp_path):
+    count, log, dest = get_deps(tmp_path, bundle_pages(tmp_path, {"libfoo_1.0_amd64.deb": b"foo", "libbar_2_all.deb": b"b"}))
+    assert count == 2 and sorted(os.listdir(str(dest))) == ["libbar_2_all.deb", "libfoo_1.0_amd64.deb"]
+    assert log == ["2 dependency package(s) from the store (%s, bundled 2026-11-18T21:30:45+00:00)" % KEY]
+
+
+def test_get_dependencies_without_a_bundle_is_silent(tmp_path):
+    count, log, dest = get_deps(tmp_path, {})
+    assert count == 0 and log == [] and os.listdir(str(dest)) == []
+
+
+@pytest.mark.parametrize("change, message", [
+    (dict(sha256="0" * 64), "SHA-256"), (dict(size=3), "bytes, expected 3"), (dict(asset="../x.tar"), "malformed"),
+    (dict(asset="dependencies.tar"), "malformed"), (dict(sha256=None), "malformed"), (dict(size="1"), "malformed"),
+    (dict(created=None), "malformed")])
+def test_get_dependencies_never_fails_a_job_and_leaves_nothing_half_done(tmp_path, change, message):
+    count, log, dest = get_deps(tmp_path, bundle_pages(tmp_path, {"libfoo_1.0_amd64.deb": b"foo"}, **change))
+    assert count == 0 and os.listdir(str(dest)) == []
+    assert len(log) == 1 and log[0].startswith("::warning::KiCad's stored dependencies could not be used") and message in log[0]
+
+
+def test_get_dependencies_with_a_bad_bundle_removes_what_it_unpacked(tmp_path):
+    count, log, dest = get_deps(tmp_path, bundle_pages(tmp_path, {"good_1_all.deb": b"x", "../evil.deb": b"x"}))
+    assert count == 0 and os.listdir(str(dest)) == [] and "unexpected entry" in log[0]
+    pages = {DEPS_URL: b"[1, 2]"}
+    assert get_deps(tmp_path, pages)[0] == 0
+    pages = {DEPS_URL: http_error(DEPS_URL, 503)}
+    count, log, dest = get_deps(tmp_path, pages)
+    assert count == 0 and "503" in log[0]
+
+
+@pytest.mark.parametrize("created, fresh", [
+    ("2026-11-18T21:30:45+00:00", True), ("2026-11-12T00:00:00+00:00", True), ("2026-11-11T21:30:45+00:00", False),
+    ("2026-01-01T00:00:00+00:00", False), ("2026-11-19T00:00:00+00:00", False), ("2026-11-18T20:00:00", True),
+    ("yesterday", False), (None, False), (20261118, False)])
+def test_deps_are_fresh(created, fresh):
+    assert kc.deps_are_fresh({"created": created}, NOW) is fresh
+    assert kc.deps_are_fresh({}, NOW) is False
+
+
+def test_utc_now_has_a_time_zone():
+    assert kc.utc_now().tzinfo is not None
+
+
+def some_debs(tmp_path):
+    paths = []
+    for name in ("kicad_10.0.8.ubuntu24.04.1_amd64.deb", "kicad-demos_10.0.8.ubuntu24.04.1_all.deb"):
+        (tmp_path / name).write_bytes(b"x")
+        paths.append(str(tmp_path / name))
+    return paths
+
+
+def test_build_deps_bundle(tmp_path):
+    gh = Gh()
+    path, index = kc.build_deps_bundle(some_debs(tmp_path), str(tmp_path / "w"), gh, NOW, root=False)
+    assert os.path.basename(path) == index["asset"] == "dependencies-202611182130.tar"
+    assert index == {"schema": 1, "asset": "dependencies-202611182130.tar", "count": 2,
+                     "created": "2026-11-18T21:30:45+00:00", "size": os.path.getsize(path),
+                     "sha256": sha(open(path, "rb").read())}
+    with tarfile.open(path) as tar:
+        assert tar.getnames() == ["libbar_1%3a2.0-1_all.deb", "libfoo_1.0_amd64.deb"]       # debs only, no lock file
+        assert all(m.uid == 0 and m.mode == 0o644 for m in tar.getmembers())
+    update, install = gh.apt_calls
+    assert update[:3] == ["sudo", "timeout", "600"] and update[-1] == "update"
+    assert install[:3] == ["sudo", "timeout", "1800"]
+    assert kc.DEPS_ASSET_RE.match(index["asset"])
+    out = tmp_path / "out"
+    out.mkdir()
+    assert kc.unpack_debs(path, str(out)) == 2                           # what get reads back
+
+
+def test_build_deps_bundle_as_root_uses_no_sudo(tmp_path):
+    gh = Gh()
+    kc.build_deps_bundle(some_debs(tmp_path), str(tmp_path / "w"), gh, NOW, root=True)
+    assert all(call[0] == "timeout" for call in gh.apt_calls)
+    gh = Gh()
+    kc.build_deps_bundle(some_debs(tmp_path), str(tmp_path / "w2"), gh, NOW)           # asks the system
+    assert gh.apt_calls[0][0] == ("timeout" if os.geteuid() == 0 else "sudo")
+
+
+@pytest.mark.parametrize("gh, message", [
+    (Gh(apt_fail="update"), "apt-get update failed .exit 100.: E: mirror is down"),
+    (Gh(apt_fail="install"), "apt-get install --download-only failed"),
+    (Gh(apt_fail=OSError("no apt-get")), "cannot run apt-get update"),
+    (Gh(apt_files=()), "refusing to publish an empty bundle")])
+def test_build_deps_bundle_failures(tmp_path, gh, message):
+    with pytest.raises(kc.CacheError, match=message):
+        kc.build_deps_bundle(some_debs(tmp_path), str(tmp_path / "w"), gh, NOW, root=True)
+    assert not [f for f in os.listdir(str(tmp_path / "w")) if f.endswith(".tar")]
+
+
+def refresh(tmp_path, pages, gh, folder=None):
+    log = []
+    manifest = json.loads(github({"kicad": (V, KICAD)})[kc.asset_url(REPO, KEY, "manifest.json")])
+    done = kc.refresh_dependencies(REPO, KEY, manifest, str(folder or tmp_path / "w"), net_for(Web(pages)), gh, NOW,
+                                   log=log.append)
+    return done, log
+
+
+def test_refresh_leaves_a_fresh_bundle_alone(tmp_path):
+    gh = Gh()
+    done, log = refresh(tmp_path, bundle_pages(tmp_path, {"a_1_all.deb": b"x"}, created="2026-11-15T00:00:00+00:00"), gh)
+    assert done is False and gh.calls == [] and gh.apt_calls == [] and "still fresh" in log[0]
+
+
+@pytest.mark.parametrize("old_index", [None, dict(created="2026-11-01T00:00:00+00:00"), dict(sha256="broken")])
+def test_refresh_publishes_tar_then_index_then_removes_the_old_tars(tmp_path, old_index):
+    pages = github({"kicad": (V, KICAD)})
+    if old_index is not None:
+        pages.update(bundle_pages(tmp_path, {"a_1_all.deb": b"x"}, **old_index))
+    gh = Gh(assets=["manifest.json", "kicad_10.0.8.ubuntu24.04.1_all.deb", "dependencies-202611010000.tar",
+                    "dependencies-202611182130.tar", "dependencies.json", "dependencies-notes.tar"])
+    done, log = refresh(tmp_path, pages, gh)
+    assert done is True and log[-1] == "%s: 2 dependency packages bundled (dependencies-202611182130.tar)" % KEY
+    tar, index, view, delete = gh.calls
+    assert tar[2] == "upload" and tar[-1].endswith("dependencies-202611182130.tar") and "--clobber" in tar
+    assert index[2] == "upload" and index[-1].endswith("dependencies.json")
+    assert json.load(open(index[-1]))["sha256"] == sha(open(tar[-1], "rb").read())
+    assert view[2] == "view" and delete[2:5] == ["delete-asset", KEY, "dependencies-202611010000.tar"]
+    # the KiCad package came from the store, checked, and was handed to apt
+    assert any(a.endswith("kicad_10.0.8.ubuntu24.04.1_all.deb") for a in gh.apt_calls[1])
+
+
+def test_refresh_uses_the_packages_already_in_the_folder(tmp_path):
+    folder = tmp_path / "w"
+    folder.mkdir()
+    (folder / "kicad_10.0.8.ubuntu24.04.1_all.deb").write_bytes(KICAD)
+    done, log = refresh(tmp_path, {}, Gh(), folder=folder)              # nothing to download: no page is served
+    assert done is True
+
+
+def test_refresh_fails_loudly(tmp_path):
+    pages = github({"kicad": (V, KICAD)})
+    with pytest.raises(kc.CacheError, match="mirror is down"):
+        refresh(tmp_path, pages, Gh(apt_fail="install"))
+    with pytest.raises(kc.CacheError, match="HTTP 502"):
+        refresh(tmp_path, pages, Gh(fail="upload"))
+    gh = Gh()
+    gh.assets = None                                                    # gh answers without an asset list
+    with pytest.raises(kc.CacheError, match="gave no asset list"):
+        refresh(tmp_path, pages, gh)
+    with pytest.raises(kc.CacheError, match="SHA-256"):                 # a stored package that is not what the manifest says
+        refresh(tmp_path / "x", dict(pages, **{kc.asset_url(REPO, KEY, "kicad_10.0.8.ubuntu24.04.1_all.deb"): b"kicad package byteZ"}), Gh())
+
+
+def test_store_bundles_the_dependencies_of_a_new_release_and_get_reads_them(tmp_path):
+    gh = Gh()
+    done, log = run_store(tmp_path, launchpad({"kicad": (V, KICAD), "kicad-demos": (V, DEMOS)}), gh,
+                          dependencies=True, now=NOW)
+    assert done == [(KEY, "stored")]
+    assert [c[2] for c in gh.calls] == ["view", "create", "upload", "upload", "upload", "view", "list"]
+    pages = {}
+    for call in gh.calls:
+        for path in [a for a in call if a.endswith((".deb", ".json", ".tar"))]:
+            pages[kc.asset_url(REPO, KEY, os.path.basename(path))] = open(path, "rb").read()
+    count, log, dest = get_deps(tmp_path, pages)
+    assert count == 2 and (dest / "libfoo_1.0_amd64.deb").read_bytes() == b"dependency libfoo_1.0_amd64.deb"
+
+
+def test_store_refreshes_the_bundle_of_a_version_stored_earlier(tmp_path):
+    pages = launchpad({"kicad": (V, KICAD), "kicad-demos": (V, DEMOS)})
+    pages.update(github({"kicad": (V, KICAD)}))
+    gh = Gh()
+    done, log = run_store(tmp_path, dict(pages), gh, dependencies=True, now=NOW)
+    assert done == [(KEY, "already stored")] and [c[2] for c in gh.calls] == ["upload", "upload", "view", "list"]
+    pages.update(bundle_pages(tmp_path, {"a_1_all.deb": b"x"}))          # and once it is fresh, nothing is published
+    gh = Gh()
+    run_store(tmp_path, pages, gh, dependencies=True, now=NOW)
+    assert [c[2] for c in gh.calls] == ["list"] and gh.apt_calls == []
+
+
+def test_store_keeps_the_bundles_of_older_stored_versions_fresh(tmp_path):
+    """jobs pin a version long after the PPA has moved on: its bundle is refreshed too"""
+    new = "10.0.9~ubuntu24.04.1"
+    new_key, old_key = "kicad-10.0.9-ubuntu24.04-amd64", KEY
+    pages = launchpad({"kicad": (new, KICAD), "kicad-demos": (new, DEMOS)})
+    for key in (new_key, old_key):
+        stored = github({"kicad": (new if key == new_key else V, KICAD)}, key=key)
+        manifest_url = kc.asset_url(REPO, key, "manifest.json")
+        manifest = json.loads(stored[manifest_url])
+        manifest["kicad_version"] = key.split("-")[1]
+        stored[manifest_url] = json.dumps(manifest).encode()
+        pages.update(stored)
+    gh = Gh(tags=[old_key, new_key, "kicad-10.0.7-ubuntu24.04-amd64", "kicad-10.0.8-ubuntu24.04-arm64",
+                  "kicad-9.0.6-ubuntu24.04-amd64", "kicad-10.0.8-ubuntu22.04-amd64", "v1", "xkicad-10.0.8-ubuntu24.04-amd64x"])
+    done, log = run_store(tmp_path, pages, gh, dependencies=True, now=NOW)
+    assert done == [(new_key, "already stored")]
+    uploads = [c[3] for c in gh.calls if c[2] == "upload"]
+    assert uploads == [new_key, new_key, old_key, old_key]              # 10.0.7 has no manifest: passed over
+    assert not any("9.0.6" in " ".join(c) or "arm64" in " ".join(c) or "22.04" in " ".join(c) for c in gh.calls)
+
+
+def test_store_of_a_named_version_touches_no_other_release(tmp_path):
+    gh = Gh(tags=[KEY])
+    run_store(tmp_path, launchpad({"kicad": (V, KICAD), "kicad-demos": (V, DEMOS)}), gh, dependencies=True, now=NOW,
+              version="10.0.8")
+    assert "list" not in [c[2] for c in gh.calls]
+
+
+def test_stored_keys_needs_a_list_from_gh(tmp_path):
+    wanted = [("10.0", "24.04", "noble", "amd64")]
+    assert kc.stored_keys(REPO, wanted, Gh(tags=["kicad-10.0.10-ubuntu24.04-amd64", KEY, None])) == [
+        "kicad-10.0.10-ubuntu24.04-amd64", KEY]
+    for bad in ("not json", '{"tagName": "x"}', "[1]"):
+        with pytest.raises(kc.CacheError, match="gave no list of tags"):
+            kc.stored_keys(REPO, wanted, Gh(tags=bad))
+
+
+def test_get_dependencies_leaves_a_folder_with_files_alone(tmp_path):
+    dest = tmp_path / "deps"
+    dest.mkdir()
+    (dest / "mine.txt").write_text("keep")
+    log = []
+    pages = bundle_pages(tmp_path, {"libfoo_1.0_amd64.deb": b"foo"})
+    assert kc.get_dependencies(REPO, KEY, str(dest), net_for(Web(pages)), log=log.append) == 0
+    assert os.listdir(str(dest)) == ["mine.txt"] and "is not empty" in log[0]
+
+
+def test_cli_get_with_dependencies(tmp_path):
+    pages = github({"kicad": (V, KICAD)})
+    pages.update(bundle_pages(tmp_path, {"libfoo_1.0_amd64.deb": b"foo"}))
+    output = tmp_path / "out.txt"
+    code, out = cli(["get", "--version", "10.0.8", "--dest", str(tmp_path / "d"), "--dependencies-dest",
+                     str(tmp_path / "deps"), "--os-release", os_release(tmp_path), "--github-output", str(output)], pages)
+    assert code == 0 and output.read_text() == "key=%s\ncache-hit=true\ndependencies=1\n" % KEY
+    assert os.listdir(str(tmp_path / "deps")) == ["libfoo_1.0_amd64.deb"]
